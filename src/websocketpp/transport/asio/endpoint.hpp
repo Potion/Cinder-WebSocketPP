@@ -91,6 +91,7 @@ public:
     explicit endpoint()
       : m_external_io_service(false)
       , m_listen_backlog(0)
+      , m_reuse_addr(false)
       , m_state(UNINITIALIZED)
     {
         //std::cout << "transport::asio::endpoint constructor" << std::endl;
@@ -122,7 +123,8 @@ public:
       : m_io_service(src.m_io_service)
       , m_external_io_service(src.m_external_io_service)
       , m_acceptor(src.m_acceptor)
-      , m_listen_backlog(0)
+      , m_listen_backlog(boost::asio::socket_base::max_connections)
+      , m_reuse_addr(src.m_reuse_addr)
       , m_state(src.m_state)
     {
         src.m_io_service = NULL;
@@ -136,13 +138,14 @@ public:
             m_io_service = rhs.m_io_service;
             m_external_io_service = rhs.m_external_io_service;
             m_acceptor = rhs.m_acceptor;
-            m_listen_backlog = rhs.m_listen_backlog
+            m_listen_backlog = rhs.m_listen_backlog;
+            m_reuse_addr = rhs.m_reuse_addr;
             m_state = rhs.m_state;
 
             rhs.m_io_service = NULL;
             rhs.m_external_io_service = false;
             rhs.m_acceptor = NULL;
-            rhs.m_listen_backlog = 0;
+            rhs.m_listen_backlog = boost::asio::socket_base::max_connections;
             rhs.m_state = UNINITIALIZED;
         }
         return *this;
@@ -228,7 +231,7 @@ public:
      * established but before any additional wrappers (proxy connects, TLS
      * handshakes, etc) have been performed.
      *
-     * @since 0.4.0-alpha1
+     * @since 0.3.0
      *
      * @param h The handler to call on tcp pre init.
      */
@@ -257,7 +260,7 @@ public:
      * etc have been performed. This is fired before any bytes are read or any
      * WebSocket specific handshake logic has been performed.
      *
-     * @since 0.4.0-alpha1
+     * @since 0.3.0
      *
      * @param h The handler to call on tcp post init.
      */
@@ -280,12 +283,30 @@ public:
      * A value of zero will use the operating system default. This is the
      * default value.
      *
-     * @since 0.4.0-alpha1
+     * @since 0.3.0
      *
      * @param backlog The maximum length of the queue of pending connections
      */
     void set_listen_backlog(int backlog) {
         m_listen_backlog = backlog;
+    }
+    
+    /// Sets whether or not to use the SO_REUSEADDR flag when opening a listening socket
+    /**
+     * Specifies whether or not to use the SO_REUSEADDR TCP socket option. What this flag
+     * does depends on your operating system. Please consult operating system
+     * documentation for more details.
+     *
+     * New values affect future calls to listen only.
+     *
+     * The default is false.
+     *
+     * @since 0.3.0
+     *
+     * @param value Whether or not to use the SO_REUSEADDR option
+     */
+    void set_reuse_addr(bool value) {
+        m_reuse_addr = value;
     }
 
     /// Retrieve a reference to the endpoint's io_service
@@ -323,16 +344,25 @@ public:
 
         m_alog->write(log::alevel::devel,"asio::listen");
 
-        m_acceptor->open(ep.protocol());
-        m_acceptor->set_option(boost::asio::socket_base::reuse_address(true));
-        m_acceptor->bind(ep);
-        if (m_listen_backlog == 0) {
-            m_acceptor->listen();
-        } else {
-            m_acceptor->listen(m_listen_backlog);
+        boost::system::error_code bec;
+
+        m_acceptor->open(ep.protocol(),bec);
+        if (!bec) {
+            m_acceptor->set_option(boost::asio::socket_base::reuse_address(m_reuse_addr),bec);
         }
-        m_state = LISTENING;
-        ec = lib::error_code();
+        if (!bec) {
+            m_acceptor->bind(ep,bec);
+        }
+        if (!bec) {
+            m_acceptor->listen(m_listen_backlog,bec);
+        }
+        if (bec) {
+            log_err(log::elevel::info,"asio listen",bec);
+            ec = make_error_code(error::pass_through);
+        } else {
+            m_state = LISTENING;
+            ec = lib::error_code();
+        }
     }
 
     /// Set up endpoint for listening manually
@@ -518,6 +548,14 @@ public:
         }
     }
 
+    /// Check if the endpoint is listening
+    /**
+     * @return Whether or not the endpoint is listening.
+     */
+    bool is_listening() const {
+        return (m_state == LISTENING);
+    }
+
     /// wraps the run method of the internal io_service object
     std::size_t run() {
         return m_io_service->run();
@@ -566,7 +604,7 @@ public:
      * called either before the endpoint has run out of work or before it was
      * started
      *
-     * @since 0.4.0-alpha1
+     * @since 0.3.0
      */
     void start_perpetual() {
         m_work.reset(new boost::asio::io_service::work(*m_io_service));
@@ -578,7 +616,7 @@ public:
      * method to exit normally when it runs out of connections. If there are
      * currently active connections it will not end until they are complete.
      *
-     * @since 0.4.0-alpha1
+     * @since 0.3.0
      */
     void stop_perpetual() {
         m_work.reset();
@@ -653,10 +691,8 @@ public:
         lib::error_code & ec)
     {
         if (m_state != LISTENING) {
-            m_elog->write(log::elevel::library,
-                "asio::async_accept called from the wrong state");
             using websocketpp::error::make_error_code;
-            ec = make_error_code(websocketpp::error::invalid_state);
+            ec = make_error_code(websocketpp::error::async_accept_not_listening);
             return;
         }
 
@@ -721,8 +757,12 @@ protected:
         m_alog->write(log::alevel::devel, "asio::handle_accept");
 
         if (boost_ec) {
-            log_err(log::elevel::devel,"asio handle_accept",boost_ec);
-            ret_ec = make_error_code(error::pass_through);
+            if (boost_ec == boost::system::errc::operation_canceled) {
+                ret_ec = make_error_code(websocketpp::error::operation_canceled);
+            } else {
+                log_err(log::elevel::info,"asio handle_accept",boost_ec);
+                ret_ec = make_error_code(error::pass_through);
+            }
         }
 
         callback(ret_ec);
@@ -962,10 +1002,6 @@ protected:
         callback(lib::error_code());
     }
 
-    bool is_listening() const {
-        return (m_state == LISTENING);
-    }
-
     /// Initialize a connection
     /**
      * init is called by an endpoint once for each newly created connection.
@@ -1022,6 +1058,7 @@ private:
 
     // Network constants
     int                 m_listen_backlog;
+    bool                m_reuse_addr;
 
     elog_type* m_elog;
     alog_type* m_alog;

@@ -33,6 +33,7 @@
 #include <vector>
 
 namespace websocketpp {
+/// HTTP handling support
 namespace http {
     /// The type of an HTTP attribute list
     /**
@@ -255,7 +256,7 @@ namespace http {
                 case internal_server_error:
                     return "Internal Server Error";
                 case not_implemented:
-                    return "Not Implimented";
+                    return "Not Implemented";
                 case bad_gateway:
                     return "Bad Gateway";
                 case service_unavailable:
